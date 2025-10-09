@@ -645,6 +645,32 @@ func (kc *TokenKubernetesClient) extractTokenAndDisplayNameFromSecret(ctx contex
 	return tokenValue, tokenName
 }
 
+func (kc *TokenKubernetesClient) findServiceAccountTokenSecret(ctx context.Context, namespace, modelName string) string {
+	var secretList corev1.SecretList
+	if err := kc.Client.List(ctx, &secretList,
+		client.InNamespace(namespace),
+		client.MatchingLabels{"opendatahub.io/dashboard": "true"},
+	); err != nil {
+		kc.Logger.Warn("failed to list secrets", "error", err, "namespace", namespace)
+		return ""
+	}
+
+	for _, secret := range secretList.Items {
+		if secret.Type != corev1.SecretTypeServiceAccountToken {
+			continue
+		}
+		if saAnnotation, ok := secret.Annotations["kubernetes.io/service-account.name"]; ok {
+			if strings.Contains(saAnnotation, modelName) {
+				kc.Logger.Info("found service account token secret", "secretName", secret.Name, "saName", saAnnotation)
+				return secret.Name
+			}
+		}
+	}
+
+	kc.Logger.Warn("service account token secret not found", "modelName", modelName, "namespace", namespace)
+	return ""
+}
+
 // Helper method to extract description from LLMInferenceService annotations
 func (kc *TokenKubernetesClient) extractDescriptionFromLLMInferenceService(llmSvc *kservev1alpha1.LLMInferenceService) string {
 	if llmSvc == nil || llmSvc.Annotations == nil {
@@ -730,6 +756,51 @@ func (kc *TokenKubernetesClient) InstallLlamaStackDistribution(ctx context.Conte
 	// Step 1: Create LlamaStackDistribution resource first
 
 	configMapName := "llama-stack-config"
+
+	// Find service account token secret for the first model
+	var tokenSecretName string
+	if len(models) > 0 {
+		tokenSecretName = kc.findServiceAccountTokenSecret(ctx, namespace, models[0])
+	}
+
+	// Build environment variables
+	envVars := []corev1.EnvVar{
+		{
+			Name:  "VLLM_TLS_VERIFY",
+			Value: "false",
+		},
+		{
+			Name:  "MILVUS_DB_PATH",
+			Value: "~/.llama/milvus.db",
+		},
+		{
+			Name:  "FMS_ORCHESTRATOR_URL",
+			Value: "http://localhost",
+		},
+		{
+			Name:  "VLLM_MAX_TOKENS",
+			Value: "4096",
+		},
+	}
+
+	// Add VLLM_TOKEN if we found a token secret
+	if tokenSecretName != "" {
+		envVars = append(envVars, corev1.EnvVar{
+			Name: "VLLM_API_TOKEN",
+			ValueFrom: &corev1.EnvVarSource{
+				SecretKeyRef: &corev1.SecretKeySelector{
+					LocalObjectReference: corev1.LocalObjectReference{
+						Name: tokenSecretName,
+					},
+					Key: "token",
+				},
+			},
+		})
+		kc.Logger.Info("added VLLM_API_TOKEN environment variable", "tokenSecretName", tokenSecretName)
+	} else {
+		kc.Logger.Warn("no service account token secret found, VLLM will work without authentication", "models", models)
+	}
+
 	lsd := &lsdapi.LlamaStackDistribution{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      lsdName,
@@ -756,24 +827,7 @@ func (kc *TokenKubernetesClient) InstallLlamaStackDistribution(ctx context.Conte
 							corev1.ResourceMemory: resource.MustParse("12Gi"),
 						},
 					},
-					Env: []corev1.EnvVar{
-						{
-							Name:  "VLLM_TLS_VERIFY",
-							Value: "false",
-						},
-						{
-							Name:  "MILVUS_DB_PATH",
-							Value: "~/.llama/milvus.db",
-						},
-						{
-							Name:  "FMS_ORCHESTRATOR_URL",
-							Value: "http://localhost",
-						},
-						{
-							Name:  "VLLM_MAX_TOKENS",
-							Value: "4096",
-						},
-					},
+					Env:  envVars,
 					Name: "llama-stack",
 					Port: 8321,
 				},
